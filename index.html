@@ -37,6 +37,234 @@
     .footer{max-width:1100px;margin:20px auto 60px;padding:0 14px;color:#666;font-size:13px}
   </style>
 </head>
+  <script>
+// ================== CẤU HÌNH BACKEND ==================
+const BACKEND_URL = "https://bilingual-chatbox.onrender.com";
+const WS_URL      = "wss://bilingual-chatbox.onrender.com/ws";
+// ======================================================
+
+// Lấy phần tử sẵn có trên trang
+const $ = id => document.getElementById(id);
+const localVideo  = $("localVideo");
+const remoteVideo = $("remoteVideo");
+
+// Tiện ích nhỏ
+function logBox(){ return document.getElementById("log") || {appendChild(){},scrollTop:0,scrollHeight:0}; }
+function log(msg){ const d=document.createElement("div"); d.textContent=msg; logBox().appendChild(d); logBox().scrollTop=logBox().scrollHeight; }
+
+// ====== ROOM từ URL (?room=abc). Nếu không có sẽ tự tạo & hiện link ======
+function ensureRoom(){
+  const u = new URL(location.href);
+  let room = u.searchParams.get("room");
+  if (!room){
+    room = "thuy-" + Math.random().toString(36).slice(2,7);
+    const link = location.origin + location.pathname + "?room=" + room;
+    alert("Đã tạo phòng tạm: " + room + "\nLink phòng đã copy!");
+    navigator.clipboard.writeText(link).catch(()=>{});
+    // Cập nhật thanh địa chỉ (không reload)
+    history.replaceState(null,"", "?room="+room);
+  }
+  return room;
+}
+const ROOM_ID = ensureRoom();
+
+// ====== Media (bấm nút Bật camera/mic của bản cũ vẫn dùng bình thường) ======
+let localStream = null;
+async function startMediaOnce(){
+  if (localStream) return;
+  localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  localVideo.srcObject = localStream;
+  log("✅ Camera/mic OK");
+}
+if (window.btnStart) {
+  btnStart.onclick = startMediaOnce;
+}
+if (window.btnMute) {
+  let micMuted=false;
+  btnMute.onclick = ()=>{
+    if(!localStream) return;
+    micMuted = !micMuted;
+    localStream.getAudioTracks().forEach(t=>t.enabled=!micMuted);
+    btnMute.textContent = micMuted ? "🔊 Bật mic" : "🔇 Tắt mic";
+  };
+}
+
+// ====== WebRTC + WS signaling (AUTO) ======
+let pc, dataChannel;
+const iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+
+function setupPC(){
+  pc = new RTCPeerConnection({ iceServers: iceServers });
+  if (localStream) localStream.getTracks().forEach(t=>pc.addTrack(t, localStream));
+  pc.ontrack = e => { remoteVideo.srcObject = e.streams[0]; };
+  pc.onicecandidate = e => {
+    if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type:"ice", candidate: e.candidate, targetId: targetId }));
+    }
+  };
+  dataChannel = pc.createDataChannel("chat");
+  dataChannel.onopen  = ()=>log("🔗 DataChannel mở");
+  dataChannel.onclose = ()=>log("🔌 DataChannel đóng");
+  dataChannel.onmessage = ev => handleIncoming(JSON.parse(ev.data || "{}"));
+}
+
+function sendDC(obj){
+  try { (dataChannel?.readyState==="open") && dataChannel.send(JSON.stringify(obj)); } catch {}
+}
+
+// Chat nhanh (tận dụng UI cũ nếu có)
+if (window.btnSend && window.chatInput) {
+  btnSend.onclick = ()=>{
+    const t = chatInput.value.trim(); if(!t) return;
+    sendDC({ type:"chat", text:t });
+    addBubble && addBubble(t,"you");
+    chatInput.value="";
+  };
+  chatInput.addEventListener("keydown",e=>{ if(e.key==="Enter") btnSend.click(); });
+}
+
+// Nhận tin nhắn (dùng bubble UI cũ nếu có)
+function handleIncoming(msg){
+  if (msg.type==="chat"){ addBubble && addBubble(msg.text,"them"); }
+  if (msg.type==="xlate"){ addBubble && addBubble("📣 "+msg.text,"them"); speak && speak(msg.text); }
+  if (msg.type==="fileMeta" || msg.type==="fileChunk"){ // giữ nguyên luồng file của bản cũ nếu có
+    if (typeof receiveFileChunk === "function") {
+      if(msg.type==="fileMeta"){ startReceivingFile && startReceivingFile(msg); }
+      else receiveFileChunk(msg);
+    }
+  }
+}
+
+// ====== WebSocket flow ======
+let ws, selfId=null, targetId=null, role=null; // role: "caller" hoặc "callee"
+
+async function connectWS(){
+  await startMediaOnce(); // đảm bảo đã xin quyền
+  setupPC();
+
+  ws = new WebSocket(`${WS_URL}?room=${encodeURIComponent(ROOM_ID)}`);
+  ws.onopen = ()=> log("🌐 WS connected");
+  ws.onclose = ()=> log("🌐 WS closed");
+  ws.onmessage = async (ev)=>{
+    let m={}; try{ m = JSON.parse(ev.data);}catch{}
+    if (m.type==="joined"){ selfId = m.selfId; log("🧩 Join phòng: "+ROOM_ID+" (bạn #"+selfId+")"); }
+    if (m.type==="init-caller"){ role="caller"; targetId=m.targetId; await doCaller(); }
+    if (m.type==="init-callee"){ role="callee"; targetId=m.targetId; }
+    if (m.type==="offer" && role==="callee"){ await handleOffer(m); }
+    if (m.type==="answer" && role==="caller"){ await handleAnswer(m); }
+    if (m.type==="ice"){ try{ await pc.addIceCandidate(m.candidate); }catch{} }
+    if (m.type==="peer-left"){ log("🚪 Người kia rời phòng"); }
+  };
+}
+
+async function doCaller(){
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  ws.send(JSON.stringify({ type:"offer", sdp: offer.sdp, targetId }));
+}
+
+async function handleOffer(m){
+  await pc.setRemoteDescription({ type:"offer", sdp:m.sdp });
+  const ans = await pc.createAnswer();
+  await pc.setLocalDescription(ans);
+  ws.send(JSON.stringify({ type:"answer", sdp: ans.sdp, targetId }));
+}
+
+async function handleAnswer(m){
+  await pc.setRemoteDescription({ type:"answer", sdp:m.sdp });
+}
+
+// Tự kết nối WS sau khi user bật camera (để tránh block quyền)
+if (window.btnStart) {
+  const old = btnStart.onclick;
+  btnStart.onclick = async ()=>{
+    await startMediaOnce();
+    await connectWS();
+    old && old();
+  };
+} else {
+  // nếu trang không có nút, tự làm luôn
+  (async ()=>{ await startMediaOnce(); await connectWS(); })();
+}
+
+// ====== DỊCH (gọi backend /api/translate) ======
+async function translateServer(text, direction){
+  const resp = await fetch(`${BACKEND_URL}/api/translate`,{
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ text, direction })
+  });
+  const j = await resp.json();
+  return j.translated || "";
+}
+
+// Web Speech (nếu trang cũ đã có nút, tận dụng lại)
+if (window.btnASR && window.btnASRStop) {
+  let recognition, recognizing=false;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+  function startASR(){
+    if(!SR){ alert("Trình duyệt chưa hỗ trợ SpeechRecognition. Hãy dùng Chrome."); return; }
+    recognition = new SR();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    // hướng dịch trên trang cũ nếu có, mặc định vi->en
+    const dirSel = document.getElementById("direction");
+    const dir = dirSel ? dirSel.value : "vi-en";
+    recognition.lang = (dir==="en-vi") ? "en-US" : "vi-VN";
+    recognition.onresult = async (e)=>{
+      for(let i=e.resultIndex;i<e.results.length;i++){
+        const r = e.results[i];
+        if(r.isFinal){
+          const finalText = r[0].transcript.trim();
+          if (finalText){
+            addBubble && addBubble(finalText,"you");
+            const translated = await translateServer(finalText, dir);
+            if (translated){
+              sendDC({ type:"xlate", text:translated });
+              addBubble && addBubble("📣 "+translated,"you");
+            }
+          }
+        }
+      }
+    };
+    recognition.onend = ()=>{ if(recognizing) recognition.start(); };
+    recognition.start(); recognizing = true;
+    log("🎙️ Đang nghe...");
+  }
+
+  function stopASR(){ recognizing=false; recognition && recognition.stop(); log("⏹️ Dừng nghe"); }
+
+  btnASR.onclick = startASR;
+  btnASRStop.onclick = stopASR;
+}
+
+// ====== TTS (dùng voice menu cũ nếu có) ======
+let ttsEnabled = true;
+if (window.btnSpeakToggle) {
+  btnSpeakToggle.onclick = ()=>{
+    ttsEnabled = !ttsEnabled;
+    btnSpeakToggle.textContent = ttsEnabled ? "🔊 TTS: Bật" : "🔇 TTS: Tắt";
+  };
+}
+function speak(text){
+  if(!ttsEnabled) return;
+  const u = new SpeechSynthesisUtterance(text);
+  const sel = document.getElementById("voiceSelect");
+  if(sel){
+    const v = speechSynthesis.getVoices().find(v=>v.name===sel.value);
+    if(v) u.voice = v;
+  }
+  speechSynthesis.speak(u);
+}
+speechSynthesis.onvoiceschanged = ()=> {
+  const sel = document.getElementById("voiceSelect"); if(!sel) return;
+  sel.innerHTML = ""; speechSynthesis.getVoices().forEach(v=>{
+    const o = document.createElement("option"); o.value=v.name; o.textContent = `${v.lang} — ${v.name}`; sel.appendChild(o);
+  });
+};
+</script>
+
 <body>
   <header>
     <div class="bar">
